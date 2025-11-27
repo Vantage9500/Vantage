@@ -395,6 +395,7 @@ function setup() {
           };
 
           const isSuperAdmin = currentUser?.role === 'admin' && currentUser?.department === 'All';
+          const isDeptAdmin = currentUser?.role === 'admin' && currentUser?.department !== 'All';
 
           useEffect(() => {
             const meta1 = document.createElement('meta'); meta1.name = "apple-mobile-web-app-capable"; meta1.content = "yes"; document.head.appendChild(meta1);
@@ -416,7 +417,8 @@ function setup() {
           useEffect(() => {
             if (view !== 'login' && view !== 'signup' && scriptUrl) {
                 fetchLeaves();
-                if (isSuperAdmin) fetchUsersList();
+                // Fetch users for any admin (Super or Dept) so they can identify roles
+                if (currentUser?.role === 'admin') fetchUsersList();
                 const interval = setInterval(() => fetchLeaves(true), 15000);
                 return () => clearInterval(interval);
             }
@@ -432,7 +434,7 @@ function setup() {
                     showToast("🔔 New Leave Request!", "success");
                 }
             }
-            if (currentUser?.role === 'user') {
+            if (currentUser?.role === 'user' || isDeptAdmin) {
                 // FIXED: Case insensitive match for notifications
                 const myCurrentLeaves = leaves.filter(l => String(l.email).toLowerCase() === String(currentUser.email).toLowerCase());
                 myCurrentLeaves.forEach(currLeave => {
@@ -460,6 +462,13 @@ function setup() {
             return stats;
           };
           
+          // Helper to check role of a requester
+          const getUserRole = (email) => {
+              if (allUsers.length === 0) return 'user'; // default to user if list not loaded
+              const u = allUsers.find(user => String(user.email).toLowerCase() === String(email).toLowerCase());
+              return u ? u.role : 'user';
+          };
+
           const getAdminCategoryStats = () => {
             if (!currentUser) return { Earned: 0, Sick: 0, PersonalPaid: 0, PersonalUnpaid: 0 };
             const stats = { Earned: 0, Sick: 0, PersonalPaid: 0, PersonalUnpaid: 0 };
@@ -635,7 +644,7 @@ function setup() {
           const handleApply = async (e) => {
             e.preventDefault();
             const days = getDaysDiff(formData.startDate, formData.endDate);
-            const stats = getLeaveStats();
+            const stats = getLeaveStats(); // This now works for currentUser even if they are an admin
             const limit = currentUser.limits ? 
                 (formData.leaveType === 'Earned' ? currentUser.limits.earned : 
                  formData.leaveType === 'Sick' ? currentUser.limits.sick : 
@@ -721,7 +730,37 @@ function setup() {
           };
 
           const getFilteredLeavesForAdmin = () => {
-             const deptLeaves = leaves.filter(l => currentUser.department === 'All' || l.department === currentUser.department);
+             // DEPT ADMIN LOGIC: Show leaves for my department, BUT exclude my own (self) requests
+             // SUPER ADMIN LOGIC: Show leaves for all (Dashboard view) OR specific filter
+             
+             let deptLeaves;
+             if (activeTab === 'hr_inbox') {
+                 // SUPER ADMIN ONLY: Show leaves where the requester is an ADMIN (Dept Head)
+                 // Exclude Super Admin's own leaves from this view if they apply
+                 deptLeaves = leaves.filter(l => {
+                     const role = getUserRole(l.email);
+                     return role === 'admin' && l.department !== 'All'; 
+                 });
+             } else {
+                 // STANDARD DASHBOARD
+                 deptLeaves = leaves.filter(l => {
+                     // 1. Basic Dept Filter
+                     const matchDept = currentUser.department === 'All' || l.department === currentUser.department;
+                     if (!matchDept) return false;
+
+                     // 2. If Dept Admin, hide my own requests (I shouldn't approve myself)
+                     if (isDeptAdmin && String(l.email).toLowerCase() === String(currentUser.email).toLowerCase()) return false;
+
+                     // 3. If Super Admin (Main Dashboard), hide Admin requests (they go to HR Inbox)
+                     if (isSuperAdmin) {
+                         const role = getUserRole(l.email);
+                         if (role === 'admin') return false; 
+                     }
+                     
+                     return true;
+                 });
+             }
+
              return { 
                  pending: deptLeaves.filter(l => l.status === 'Pending').length,
                  approved: deptLeaves.filter(l => l.status === 'Approved').length,
@@ -883,7 +922,7 @@ function setup() {
           const adminStats = getFilteredLeavesForAdmin();
           const adminCatStats = getAdminCategoryStats(); 
           const userLimits = currentUser.limits || DEFAULT_LIMITS;
-          const stats = currentUser.role === 'user' ? getLeaveStats() : {};
+          const stats = currentUser.role === 'user' || isDeptAdmin ? getLeaveStats() : {}; // Enable stats for Dept Admin too
 
           // --- VIEW: MAIN APP ---
           return (
@@ -898,8 +937,20 @@ function setup() {
                       </div>
                       
                       <nav className="space-y-2">
+                          {/* Common Dashboard for all Admins & Users */}
                           <SidebarLink id="dashboard" icon={currentUser.role === 'admin' ? LayoutGrid : Send} label={currentUser.role === 'admin' ? "Dashboard" : "Apply for Leave"} active={activeTab} set={setActiveTab} />
-                          {currentUser.role === 'user' && <SidebarLink id="history" icon={List} label="My History" active={activeTab} set={setActiveTab} />}
+                          
+                          {/* HR Inbox: Only for Super Admin */}
+                          {isSuperAdmin && <SidebarLink id="hr_inbox" icon={Briefcase} label="Admin Requests" active={activeTab} set={setActiveTab} />}
+
+                          {/* Apply & History: Now visible for User AND Dept Admin (but not Super Admin who manages all) */}
+                          {(currentUser.role === 'user' || isDeptAdmin) && (
+                              <>
+                                <SidebarLink id="apply_self" icon={Send} label="Apply for Leave" active={activeTab} set={() => setActiveTab('dashboard_self')} />
+                                <SidebarLink id="history" icon={List} label="My History" active={activeTab} set={setActiveTab} />
+                              </>
+                          )}
+
                           {isSuperAdmin && <SidebarLink id="users" icon={Users} label="Team Allocations" active={activeTab} set={setActiveTab} />}
                           {isSuperAdmin && <SidebarLink id="report" icon={FileText} label="Report" active={activeTab} set={setActiveTab} />}
                           {isSuperAdmin && <SidebarLink id="settings" icon={Settings} label="Configuration" active={activeTab} set={setActiveTab} />}
@@ -913,7 +964,7 @@ function setup() {
                               <div className="w-8 h-8 bg-emerald-500 rounded-full flex items-center justify-center text-white font-bold text-xs">{currentUser.name.charAt(0)}</div>
                               <div className="overflow-hidden">
                                   <p className="text-sm font-bold text-white truncate w-32">{currentUser.name}</p>
-                                  <p className="text-[10px] text-slate-400 truncate w-32">{currentUser.role === 'admin' ? 'Administrator' : 'Employee'}</p>
+                                  <p className="text-[10px] text-slate-400 truncate w-32">{currentUser.role === 'admin' ? (isSuperAdmin ? 'Super Admin' : 'Dept. Admin') : 'Employee'}</p>
                               </div>
                           </div>
                       </div>
@@ -952,7 +1003,7 @@ function setup() {
                   {/* DESKTOP HEADER */}
                   <header className="hidden md:flex bg-white border-b border-slate-200 px-8 py-4 justify-between items-center z-20">
                       <div>
-                          <h2 className="text-xl font-bold text-slate-800">{activeTab === 'dashboard' ? 'Dashboard' : activeTab === 'history' ? 'Leave History' : activeTab === 'users' ? 'Team Management' : activeTab === 'report' ? 'Leave Report' : 'Settings'}</h2>
+                          <h2 className="text-xl font-bold text-slate-800">{activeTab === 'dashboard' ? 'Dashboard' : activeTab === 'hr_inbox' ? 'Admin Requests' : activeTab === 'history' ? 'Leave History' : activeTab === 'users' ? 'Team Management' : activeTab === 'report' ? 'Leave Report' : activeTab === 'dashboard_self' ? 'Apply for Leave' : 'Settings'}</h2>
                           <p className="text-xs text-slate-500">{getGreeting()}, {currentUser.name.split(' ')[0]}</p>
                       </div>
                       <div className="flex items-center gap-4">
@@ -972,7 +1023,8 @@ function setup() {
                   )}
 
                   <main className="flex-1 overflow-y-auto p-5 md:p-8 pb-28 md:pb-8 -mt-10 md:mt-0 relative z-20 no-scrollbar">
-                    {currentUser.role === 'user' && activeTab === 'dashboard' && (
+                    {/* USER DASHBOARD / DEPT ADMIN SELF APPLY */}
+                    {( (currentUser.role === 'user' && activeTab === 'dashboard') || (isDeptAdmin && activeTab === 'dashboard_self') ) && (
                       <div className="animate-fadeIn space-y-5 md:space-y-8 max-w-5xl mx-auto">
                         <div className="flex gap-3 md:gap-6 overflow-x-auto pb-2 px-1 no-scrollbar snap-x md:grid md:grid-cols-4">
                             <BalanceCard type="Earned" used={stats['Earned'] || 0} total={userLimits.earned || 15} icon={PieChart} colorClass="text-emerald-500" bgClass="bg-emerald-50" barClass="bg-emerald-500" />
@@ -985,6 +1037,7 @@ function setup() {
                             <h2 className="text-base md:text-lg font-bold text-slate-800 mb-5 flex items-center relative z-10"><Send className="mr-2.5 text-vantage-600" size={18}/> Apply for Leave</h2>
                             <form onSubmit={handleApply} className="space-y-4 md:space-y-6 relative z-10">
                                 <div className="grid grid-cols-2 gap-3 md:gap-6">
+                                    {/* Dept Admin is locked to their Dept, User selects Dept? Usually user is also locked but for now keep consistent */}
                                     <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5 block ml-1">Department</label><div className="relative"><select value={formData.department} onChange={(e) => setFormData({...formData, department: e.target.value})} className="w-full p-3 md:p-4 bg-slate-50 rounded-xl border border-slate-200 outline-none focus:ring-2 focus:ring-vantage-100 focus:border-vantage-500 transition-all appearance-none text-xs md:text-sm font-semibold text-slate-700">{DEPARTMENTS.map(dept => <option key={dept} value={dept}>{dept}</option>)}</select><ChevronRight className="absolute right-3 top-3 md:top-4 text-slate-400 rotate-90 pointer-events-none" size={14}/></div></div>
                                     <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5 block ml-1">Type</label><div className="relative"><select value={formData.leaveType} onChange={(e) => setFormData({...formData, leaveType: e.target.value})} className="w-full p-3 md:p-4 bg-slate-50 rounded-xl border border-slate-200 outline-none focus:ring-2 focus:ring-vantage-100 focus:border-vantage-500 transition-all appearance-none text-xs md:text-sm font-semibold text-slate-700"><option>Earned</option><option>Sick</option><option>Personal Paid</option><option>Personal Unpaid</option></select><ChevronRight className="absolute right-3 top-3 md:top-4 text-slate-400 rotate-90 pointer-events-none" size={14}/></div></div>
                                 </div>
@@ -996,14 +1049,16 @@ function setup() {
                       </div>
                     )}
 
-                    {currentUser.role === 'user' && activeTab === 'history' && (
+                    {/* HISTORY VIEW (User & Dept Admin) */}
+                    {(currentUser.role === 'user' || isDeptAdmin) && activeTab === 'history' && (
                       <div className="animate-fadeIn pt-2 max-w-5xl mx-auto">
                          <div className="flex justify-between items-center mb-4 px-1 md:hidden"><h2 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Request History</h2><button onClick={() => fetchLeaves(false)} className="p-2 bg-white border border-slate-200 rounded-full text-vantage-600 hover:bg-slate-50 active:scale-95 transition-all shadow-sm"><RefreshCw size={14} className={isLoading ? 'animate-spin' : ''}/></button></div>
-                         {leaves.filter(l => l.email === currentUser.email).length === 0 ? <div className="flex flex-col items-center justify-center h-64 text-slate-300 bg-white/50 rounded-[1.5rem] border border-dashed border-slate-200"><List size={40} className="mb-3 opacity-20"/><p className="text-xs font-medium">No records found</p></div> : <div className="space-y-3 md:grid md:grid-cols-2 md:gap-4 md:space-y-0">{leaves.filter(l => l.email === currentUser.email).map(l => <LeaveCard key={l.id} leave={l} isAdmin={false} />)}</div>}
+                         {leaves.filter(l => String(l.email).toLowerCase() === String(currentUser.email).toLowerCase()).length === 0 ? <div className="flex flex-col items-center justify-center h-64 text-slate-300 bg-white/50 rounded-[1.5rem] border border-dashed border-slate-200"><List size={40} className="mb-3 opacity-20"/><p className="text-xs font-medium">No records found</p></div> : <div className="space-y-3 md:grid md:grid-cols-2 md:gap-4 md:space-y-0">{leaves.filter(l => String(l.email).toLowerCase() === String(currentUser.email).toLowerCase()).map(l => <LeaveCard key={l.id} leave={l} isAdmin={false} />)}</div>}
                       </div>
                     )}
 
-                    {currentUser.role === 'admin' && activeTab === 'dashboard' && (
+                    {/* ADMIN DASHBOARD (Dept Admin or Super Admin) & HR INBOX (Super Admin Only) */}
+                    {currentUser.role === 'admin' && (activeTab === 'dashboard' || activeTab === 'hr_inbox') && (
                       <div className="animate-fadeIn pt-2 max-w-5xl mx-auto">
                         <div className="flex gap-2 mb-5 bg-white p-1.5 rounded-xl shadow-lg shadow-slate-200/40 border border-slate-100 sticky top-0 z-30">
                             <AdminFilterBtn label="Pending" count={adminStats.pending} active={adminSubTab === 'Pending'} onClick={() => setAdminSubTab('Pending')} activeBg="bg-amber-500" />
@@ -1379,7 +1434,10 @@ function setup() {
                   <div className="md:hidden fixed bottom-5 left-0 right-0 px-5 z-30">
                       <nav className="bg-white/90 backdrop-blur-xl border border-white/50 shadow-xl shadow-vantage-900/5 rounded-[1.5rem] flex justify-around items-center h-16 px-1">
                         <NavBtn id="dashboard" icon={currentUser.role === 'admin' ? LayoutGrid : Send} label={currentUser.role === 'admin' ? "Admin" : "Apply"} active={activeTab} set={setActiveTab} />
-                        {currentUser.role === 'user' && <NavBtn id="history" icon={List} label="History" active={activeTab} set={setActiveTab} />}
+                        {/* Only show HR Inbox for Super Admin on Mobile */}
+                        {isSuperAdmin && <NavBtn id="hr_inbox" icon={Briefcase} label="HR" active={activeTab} set={setActiveTab} />}
+                        {(currentUser.role === 'user' || isDeptAdmin) && <NavBtn id="history" icon={List} label="History" active={activeTab} set={setActiveTab} />}
+                        {(currentUser.role === 'user' || isDeptAdmin) && <NavBtn id="apply_self" icon={Send} label="Self" active={activeTab} set={() => setActiveTab('dashboard_self')} />}
                         {isSuperAdmin && <NavBtn id="users" icon={Users} label="Team" active={activeTab} set={setActiveTab} />}
                         {isSuperAdmin && <NavBtn id="report" icon={FileText} label="Report" active={activeTab} set={setActiveTab} />}
                         {isSuperAdmin && <NavBtn id="settings" icon={Settings} label="Config" active={activeTab} set={setActiveTab} />}
