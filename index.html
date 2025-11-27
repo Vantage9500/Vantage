@@ -189,11 +189,17 @@ function doPost(e) {
     }
     else if (data.action === "apply") {
       const sheet = ss.getSheetByName(SHEET_LEAVES);
+      
+      // Determine initial status based on role for the hierarchy feature
+      // Regular users and Department Admins apply using this action.
+      // Department Admins submit to HR/Super Admin ('Admin Pending'). Regular users submit to Dept Admin ('Pending').
+      const initialStatus = (data.role === 'admin' && data.department !== 'All') ? 'Admin Pending' : 'Pending';
+      
       sheet.appendRow([
         data.id, new Date(), data.name, data.email, data.department, 
-        data.leaveType, data.startDate, data.endDate, data.reason, "Pending", ""
+        data.leaveType, data.startDate, data.endDate, data.reason, initialStatus, ""
       ]);
-      sendEmailToAdmins(ss, data);
+      sendEmailToAdmins(ss, data, initialStatus); // Pass status for targeted email
       return response({status: 'success', message: 'Applied'});
     } 
     else if (data.action === "update") {
@@ -231,15 +237,35 @@ function doPost(e) {
   }
 }
 
-// ... (Keep sendEmailToAdmins, sendEmailToUser helper functions same as before)
-function sendEmailToAdmins(ss, leaveData) {
+// Updated to take status and target the correct admins
+function sendEmailToAdmins(ss, leaveData, status) {
   try {
     const userSheet = ss.getSheetByName(SHEET_USERS);
     const users = userSheet.getDataRange().getValues();
     users.forEach(u => {
       const isEmailOn = u[9] === "" ? true : u[9];
-      if (u[3] === 'admin' && isEmailOn === true && (u[4] === 'All' || u[4] === leaveData.department)) {
-          MailApp.sendEmail({to: u[1], subject: \`🔔 New Request: \${leaveData.name}\`, htmlBody: \`<p>New request from \${leaveData.name}.</p>\`});
+      const adminRole = u[3] === 'admin';
+      const isSuperAdmin = adminRole && u[4] === 'All';
+      
+      let shouldNotify = false;
+
+      if (status === 'Admin Pending') {
+        // Only Super Admins (HR) should be notified of Admin Pending requests
+        if (isSuperAdmin && isEmailOn) {
+            shouldNotify = true;
+        }
+      } else { 
+        // Status is 'Pending' (from a regular user)
+        // Notify department admins if department matches, OR notify Super Admins
+        if (adminRole && isEmailOn) {
+          if (u[4] === 'All' || u[4] === leaveData.department) {
+            shouldNotify = true;
+          }
+        }
+      }
+
+      if (shouldNotify) {
+          MailApp.sendEmail({to: u[1], subject: \`🔔 New Request: \${leaveData.name} (\${status})\`, htmlBody: \`<p>New request from \${leaveData.name} (\${leaveData.department}). Status: \${status}.</p>\`});
       }
     });
   } catch (e) {}
@@ -309,10 +335,10 @@ function setup() {
           const DEPARTMENTS = ["Brokerage", "Safety", "Local", "Inbound Custom", "Accounting", "Outbound", "Warehouse"];
           const DEFAULT_LIMITS = { 'Earned': 15, 'Sick': 10, 'Personal Paid': 5, 'Personal Unpaid': 5 };
 
-          const [view, setView] = useState('login'); 
+          const [view, setView] = useState('loading'); 
           const [currentUser, setCurrentUser] = useState(null);
           const [activeTab, setActiveTab] = useState('dashboard');
-          const [adminSubTab, setAdminSubTab] = useState('Pending');
+          const [adminSubTab, setAdminSubTab] = useState('Pending'); // Default for Department Admins
           const [leaves, setLeaves] = useState([]);
           const [allUsers, setAllUsers] = useState([]); 
           
@@ -363,7 +389,18 @@ function setup() {
           };
 
           const isSuperAdmin = currentUser?.role === 'admin' && currentUser?.department === 'All';
+          const isDepartmentAdmin = currentUser?.role === 'admin' && currentUser?.department !== 'All';
+          const isRegularUser = currentUser?.role === 'user';
+          
+          // Determine the active dashboard tab based on user role upon login
+          const getInitialTab = (user) => {
+              if (user.role === 'admin') {
+                  return 'dashboard'; // Admin Dashboard for request processing
+              }
+              return 'apply'; // Application form for regular users
+          };
 
+          // 1. Initial Load (Check Local Storage for Auth)
           useEffect(() => {
             const meta1 = document.createElement('meta'); meta1.name = "apple-mobile-web-app-capable"; meta1.content = "yes"; document.head.appendChild(meta1);
             const meta2 = document.createElement('meta'); meta2.name = "apple-mobile-web-app-status-bar-style"; meta2.content = "black-translucent"; document.head.appendChild(meta2);
@@ -371,36 +408,71 @@ function setup() {
             
             const savedUrl = localStorage.getItem('google_script_url_v2');
             if (savedUrl) setScriptUrl(savedUrl);
+            
+            const savedUser = localStorage.getItem('vantage_current_user');
+            if (savedUser) {
+                const user = JSON.parse(savedUser);
+                setCurrentUser(user);
+                setEmailEnabled(user.emailEnabled);
+                setView(user.role === 'admin' ? 'admin' : 'user');
+                setActiveTab(getInitialTab(user)); // Use the new initial tab logic
+                // Set default admin sub tab for Super Admin to catch 'Admin Pending' requests
+                if (user.department === 'All') setAdminSubTab('Admin Pending');
+            } else {
+                setView('login');
+            }
+
             const savedNotifs = localStorage.getItem('leave_app_notifications');
             if (savedNotifs) setInAppNotifs(JSON.parse(savedNotifs));
           }, []);
 
+          // 2. Persist Notifications
           useEffect(() => { localStorage.setItem('leave_app_notifications', JSON.stringify(inAppNotifs)); }, [inAppNotifs]);
 
+          // 3. Data Fetching and Auto-Refresh (Runs ONLY when logged in and URL is set)
           useEffect(() => {
-            if (view !== 'login' && view !== 'signup' && scriptUrl) {
+            if (currentUser && scriptUrl) {
+                // Fetch data immediately upon login/load
                 fetchLeaves();
-                if (isSuperAdmin) fetchUsersList();
-                const interval = setInterval(() => fetchLeaves(true), 15000);
+                if (isSuperAdmin || isDepartmentAdmin) fetchUsersList();
+
+                // Set up auto-refresh
+                const interval = setInterval(() => {
+                    fetchLeaves(true); // silent fetch
+                    if (isSuperAdmin || isDepartmentAdmin) fetchUsersList(true); // silent fetch for users
+                }, 15000); // Refreshes every 15 seconds
+
+                // Cleanup on component unmount or logout
                 return () => clearInterval(interval);
             }
-          }, [view, scriptUrl, currentUser]);
+          }, [currentUser, scriptUrl, isSuperAdmin, isDepartmentAdmin]); // Dependency on currentUser ensures this runs only after login
 
+          // 4. Notification Logic (Runs when leaves change)
           useEffect(() => {
             if (leaves.length === 0 || prevLeavesRef.current.length === 0) { prevLeavesRef.current = leaves; return; }
             const newNotifs = [];
+            
+            // Notification for Admins (Department Admins get 'Pending', Super Admins get 'Pending' AND 'Admin Pending')
             if (currentUser?.role === 'admin') {
-                const getPendingCount = (list) => list.filter(l => l.status === 'Pending' && (currentUser.department === 'All' || l.department === currentUser.department)).length;
+                const targetStatuses = currentUser.department === 'All' ? ['Pending', 'Admin Pending'] : ['Pending'];
+                
+                const getPendingCount = (list) => list.filter(l => 
+                    targetStatuses.includes(l.status) && 
+                    (currentUser.department === 'All' || l.department === currentUser.department)
+                ).length;
+                
                 if (getPendingCount(leaves) > getPendingCount(prevLeavesRef.current)) {
                     newNotifs.push({ id: Date.now(), title: "New Request", msg: "An employee applied for leave.", time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}), read: false });
                     showToast("🔔 New Leave Request!", "success");
                 }
             }
-            if (currentUser?.role === 'user') {
+            
+            // Notification for Users
+            if (isRegularUser || isDepartmentAdmin) { 
                 const myCurrentLeaves = leaves.filter(l => l.email === currentUser.email);
                 myCurrentLeaves.forEach(currLeave => {
                     const prevLeave = prevLeavesRef.current.find(p => p.id === currLeave.id);
-                    if (prevLeave && prevLeave.status === 'Pending' && currLeave.status !== 'Pending') {
+                    if (prevLeave && (prevLeave.status === 'Pending' || prevLeave.status === 'Admin Pending') && currLeave.status !== 'Pending' && currLeave.status !== 'Admin Pending') {
                         const isApproved = currLeave.status === 'Approved';
                         newNotifs.push({ id: Date.now() + Math.random(), title: isApproved ? "Leave Approved" : "Leave Rejected", msg: `Your ${currLeave.leaveType} was ${currLeave.status}.`, time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}), read: false, type: isApproved ? 'success' : 'error' });
                         showToast(isApproved ? "🎉 Approved!" : "⚠️ Update Received");
@@ -415,6 +487,7 @@ function setup() {
           const getDaysDiff = (start, end) => { const d1 = new Date(start); const d2 = new Date(end); return Math.ceil(Math.abs(d2 - d1) / (1000 * 60 * 60 * 24)) + 1 || 0; };
 
           const getLeaveStats = () => {
+            if (!currentUser) return {};
             const stats = { 'Earned': 0, 'Sick': 0, 'Personal Paid': 0, 'Personal Unpaid': 0 };
             leaves.filter(l => l.email === currentUser.email && l.status === 'Approved').forEach(l => {
                 if (stats[l.leaveType] !== undefined) stats[l.leaveType] += getDaysDiff(l.startDate, l.endDate);
@@ -425,6 +498,7 @@ function setup() {
           const getAdminCategoryStats = () => {
             if (!currentUser) return { Earned: 0, Sick: 0, PersonalPaid: 0, PersonalUnpaid: 0 };
             const stats = { Earned: 0, Sick: 0, PersonalPaid: 0, PersonalUnpaid: 0 };
+            // Admins only see leaves for their department (or All)
             const deptLeaves = leaves.filter(l => (currentUser.department === 'All' || l.department === currentUser.department) && l.status === 'Approved');
             deptLeaves.forEach(l => {
                 const days = getDaysDiff(l.startDate, l.endDate);
@@ -453,8 +527,33 @@ function setup() {
             return breakdown;
           };
 
-          const fetchUsersList = async () => { try { const r = await fetch(scriptUrl + "?action=users"); const d = await r.json(); if (d.status === 'success') setAllUsers(d.data); } catch (e) {} };
-          const fetchLeaves = async (silent = false) => { if (!scriptUrl) return; if (!silent) setIsLoading(true); try { const r = await fetch(scriptUrl); const d = await r.json(); if (d.status === 'success') setLeaves(d.data); } catch (e) { if(!silent) showToast("Sync Error", "error"); } finally { if (!silent) setIsLoading(false); } };
+          const fetchUsersList = async (silent = false) => { 
+            if (!scriptUrl) return; 
+            if (!silent) setIsLoading(true); 
+            try { 
+                const r = await fetch(scriptUrl + "?action=users"); 
+                const d = await r.json(); 
+                if (d.status === 'success') setAllUsers(d.data); 
+            } catch (e) { 
+                if(!silent) showToast("Sync Error fetching users", "error"); 
+            } finally { 
+                if (!silent) setIsLoading(false); 
+            } 
+          };
+          
+          const fetchLeaves = async (silent = false) => { 
+            if (!scriptUrl) return; 
+            if (!silent) setIsLoading(true); 
+            try { 
+                const r = await fetch(scriptUrl); 
+                const d = await r.json(); 
+                if (d.status === 'success') setLeaves(d.data); 
+            } catch (e) { 
+                if(!silent) showToast("Sync Error fetching leaves", "error"); 
+            } finally { 
+                if (!silent) setIsLoading(false); 
+            } 
+          };
 
           const handleLogin = async (e) => {
             e.preventDefault(); setIsLoginLoading(true);
@@ -466,9 +565,19 @@ function setup() {
                     if (u) {
                         if (u.isDeleted) { showToast("Account Archived.", "error"); setIsLoginLoading(false); return; }
                         if (u.isActive === false) { showToast("Account Pending Approval", "error"); setIsLoginLoading(false); return; }
-                        setCurrentUser({ name: u.name, email: u.email, role: u.role, department: u.department || 'All', limits: u.limits, emailEnabled: u.emailEnabled });
+                        
+                        const newUserState = { name: u.name, email: u.email, role: u.role, department: u.department || 'All', limits: u.limits, emailEnabled: u.emailEnabled };
+                        
+                        localStorage.setItem('vantage_current_user', JSON.stringify(newUserState));
+                        
+                        setCurrentUser(newUserState);
                         setEmailEnabled(u.emailEnabled);
-                        setView(u.role === 'admin' ? 'admin' : 'user'); setActiveTab('dashboard');
+                        setView(u.role === 'admin' ? 'admin' : 'user'); 
+                        setActiveTab(getInitialTab(newUserState)); // Set initial tab based on role
+
+                        // Set default admin sub tab for Super Admin to catch 'Admin Pending' requests
+                        if (newUserState.department === 'All') setAdminSubTab('Admin Pending');
+
                     } else showToast("Invalid Credentials", "error");
                 } else showToast("Database Error", "error");
             } catch (error) { showToast("Connection Failed", "error"); } finally { setIsLoginLoading(false); }
@@ -502,7 +611,13 @@ function setup() {
                       body: JSON.stringify({ action: 'toggle_email_pref', email: currentUser.email, enabled: newState })
                   });
                   showToast(newState ? "Email Alerts ON" : "Email Alerts OFF");
-              } catch(e) { setEmailEnabled(!newState); showToast("Failed to update preference", "error"); }
+                  // Update local storage and current user state
+                  setCurrentUser(prev => ({...prev, emailEnabled: newState}));
+                  localStorage.setItem('vantage_current_user', JSON.stringify({...currentUser, emailEnabled: newState}));
+              } catch(e) { 
+                setEmailEnabled(!newState); 
+                showToast("Failed to update preference", "error"); 
+              }
           };
 
           const handleUpdateUser = async () => {
@@ -582,10 +697,19 @@ function setup() {
              } catch (e) { showToast("Update Failed", "error"); } finally { setIsLoading(false); }
           };
 
-          const handleLogout = () => { setCurrentUser(null); setView('login'); setEmail(''); setPassword(''); setInAppNotifs([]); };
+          const handleLogout = () => { 
+            setCurrentUser(null); 
+            setView('login'); 
+            setEmail(''); 
+            setPassword(''); 
+            setInAppNotifs([]); 
+            // Clear local storage on logout
+            localStorage.removeItem('vantage_current_user');
+          };
 
           const handleApply = async (e) => {
             e.preventDefault();
+            
             const days = getDaysDiff(formData.startDate, formData.endDate);
             const stats = getLeaveStats();
             const limit = currentUser.limits ? 
@@ -599,10 +723,31 @@ function setup() {
             if (used + days > limit) return showToast(`Insufficient Balance! Limit: ${limit}`, 'error');
 
             setIsLoading(true);
+            
             try {
-              await fetch(scriptUrl, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'apply', id: 'L' + Date.now(), name: currentUser.name, email: currentUser.email, department: currentUser.department, ...formData }) });
-              setFormData({ ...formData, reason: '', startDate: '', endDate: '' }); setActiveTab('history'); showToast("Application Sent!"); fetchLeaves(true);
-            } catch (error) { showToast("Network Error", "error"); } finally { setIsLoading(false); }
+              await fetch(scriptUrl, { 
+                  method: 'POST', 
+                  mode: 'no-cors', 
+                  headers: { 'Content-Type': 'application/json' }, 
+                  body: JSON.stringify({ 
+                      action: 'apply', 
+                      id: 'L' + Date.now(), 
+                      name: currentUser.name, 
+                      email: currentUser.email, 
+                      department: currentUser.department, 
+                      role: currentUser.role, // Pass role for backend logic
+                      ...formData 
+                  }) 
+              });
+              setFormData({ ...formData, reason: '', startDate: '', endDate: '' }); 
+              setActiveTab('history'); 
+              showToast("Application Sent!"); 
+              fetchLeaves(true);
+            } catch (error) { 
+                showToast("Network Error", "error"); 
+            } finally { 
+                setIsLoading(false); 
+            }
           };
 
           const initiateAdminAction = (id, status) => { setActionModal({ id, status }); setAdminMessage(''); };
@@ -672,9 +817,19 @@ function setup() {
           };
 
           const getFilteredLeavesForAdmin = () => {
+             // Department admins see leaves for their department + Super Admins see all
              const deptLeaves = leaves.filter(l => currentUser.department === 'All' || l.department === currentUser.department);
+             
+             let pendingStatus = ['Pending'];
+             if (currentUser.department === 'All') {
+                 // Super Admin sees both normal Pending and Admin Pending requests
+                 pendingStatus = ['Pending', 'Admin Pending'];
+             }
+             
              return { 
-                 pending: deptLeaves.filter(l => l.status === 'Pending').length,
+                 pending: deptLeaves.filter(l => pendingStatus.includes(l.status)).length,
+                 adminPending: isSuperAdmin ? deptLeaves.filter(l => l.status === 'Admin Pending').length : 0,
+                 regularPending: deptLeaves.filter(l => l.status === 'Pending').length,
                  approved: deptLeaves.filter(l => l.status === 'Approved').length,
                  rejected: deptLeaves.filter(l => l.status === 'Rejected').length,
                  list: deptLeaves.filter(l => l.status === adminSubTab)
@@ -720,7 +875,7 @@ function setup() {
                   <div className={`h-10 w-10 rounded-xl flex items-center justify-center text-white font-bold shadow-md shrink-0 ${leave.leaveType === 'Sick' ? 'bg-rose-500' : leave.leaveType === 'Earned' ? 'bg-emerald-500' : 'bg-indigo-500'}`}>{leave.name.charAt(0)}</div>
                   <div><div className="font-bold text-slate-800 text-sm">{leave.name}</div><div className="flex items-center gap-2 text-xs text-slate-500 font-medium mt-0.5"><span className="bg-slate-50 px-1.5 py-0.5 rounded-md">{leave.department}</span><span>{leave.leaveType}</span></div></div>
                 </div>
-                <span className={`px-2 py-1 rounded-lg text-[10px] font-bold border ${leave.status === 'Approved' ? 'bg-emerald-50 text-emerald-600 border-emerald-100' : leave.status === 'Rejected' ? 'bg-rose-50 text-rose-600 border-rose-100' : 'bg-amber-50 text-amber-600 border-amber-100'}`}>{leave.status}</span>
+                <span className={`px-2 py-1 rounded-lg text-[10px] font-bold border ${leave.status === 'Approved' ? 'bg-emerald-50 text-emerald-600 border-emerald-100' : leave.status === 'Rejected' ? 'bg-rose-50 text-rose-600 border-rose-100' : (leave.status === 'Admin Pending' ? 'bg-purple-50 text-purple-600 border-purple-100' : 'bg-amber-50 text-amber-600 border-amber-100')}`}>{leave.status}</span>
               </div>
               <div className="pl-0.5">
                 <div className="flex items-center text-xs text-slate-600 bg-slate-50 p-3 rounded-xl border border-slate-100">
@@ -728,7 +883,7 @@ function setup() {
                    <div className="text-right pl-3 border-l border-slate-200 ml-3"><span className="block font-extrabold text-lg text-vantage-600">{getDaysDiff(leave.startDate, leave.endDate)}</span><span className="text-[9px] uppercase text-slate-400 font-bold">Days</span></div>
                 </div>
                 {leave.adminMessage && <div className="mt-2 p-2.5 bg-blue-50/50 rounded-xl border border-blue-100 flex items-start gap-2"><MessageSquare size={14} className="text-blue-500 mt-0.5 shrink-0"/><div><p className="text-[9px] text-blue-600 font-bold uppercase tracking-wide mb-0.5">Admin</p><p className="text-[11px] text-slate-700">"{leave.adminMessage}"</p></div></div>}
-                {isAdmin && leave.status === 'Pending' && (
+                {isAdmin && (leave.status === 'Pending' || (isSuperAdmin && leave.status === 'Admin Pending')) && (
                   <div className="flex gap-2 mt-3"><button onClick={() => initiateAdminAction(leave.id, 'Rejected')} className="flex-1 py-2.5 bg-white border border-rose-100 text-rose-600 rounded-xl text-xs font-bold hover:bg-rose-50 flex items-center justify-center gap-2 transition-all shadow-sm"><XCircle size={14}/> Reject</button><button onClick={() => initiateAdminAction(leave.id, 'Approved')} className="flex-1 py-2.5 bg-vantage-500 text-white rounded-xl text-xs font-bold shadow-md hover:bg-vantage-600 flex items-center justify-center gap-2 transition-all"><CheckCircle size={14}/> Approve</button></div>
                 )}
               </div>
@@ -822,8 +977,8 @@ function setup() {
 
           const adminStats = getFilteredLeavesForAdmin();
           const adminCatStats = getAdminCategoryStats(); 
-          const userLimits = currentUser.limits || DEFAULT_LIMITS;
-          const stats = currentUser.role === 'user' ? getLeaveStats() : {};
+          const userLimits = currentUser?.limits || DEFAULT_LIMITS; // Check for currentUser existence
+          const stats = isRegularUser || isDepartmentAdmin ? getLeaveStats() : {}; // Check for currentUser existence
 
           // --- VIEW: MAIN APP ---
           return (
@@ -838,10 +993,36 @@ function setup() {
                       </div>
                       
                       <nav className="space-y-2">
-                          <SidebarLink id="dashboard" icon={currentUser.role === 'admin' ? LayoutGrid : Send} label={currentUser.role === 'admin' ? "Dashboard" : "Apply for Leave"} active={activeTab} set={setActiveTab} />
-                          {currentUser.role === 'user' && <SidebarLink id="history" icon={List} label="My History" active={activeTab} set={setActiveTab} />}
+                          {/* 1. ADMIN DASHBOARD */}
+                          {(isSuperAdmin || isDepartmentAdmin) && (
+                              <SidebarLink 
+                                  id="dashboard" 
+                                  icon={LayoutGrid} 
+                                  label={isSuperAdmin ? "HR Dashboard" : "Dept. Dashboard"} 
+                                  active={activeTab} 
+                                  set={setActiveTab} 
+                              />
+                          )}
+                          
+                          {/* 2. APPLY FOR LEAVE (For Regular User AND Department Admin) */}
+                          {(isRegularUser || isDepartmentAdmin) && (
+                              <SidebarLink 
+                                  id="apply" 
+                                  icon={Send} 
+                                  label="Apply for Leave" 
+                                  active={activeTab} 
+                                  set={setActiveTab} 
+                              />
+                          )}
+
+                          {/* 3. HISTORY */}
+                          {(isRegularUser || isDepartmentAdmin) && (
+                              <SidebarLink id="history" icon={List} label="My History" active={activeTab} set={setActiveTab} />
+                          )}
+
+                          {/* ADMIN/REPORT/QUOTA TABS */}
                           {isSuperAdmin && <SidebarLink id="users" icon={Users} label="Team Allocations" active={activeTab} set={setActiveTab} />}
-                          {isSuperAdmin && <SidebarLink id="report" icon={FileText} label="Report" active={activeTab} set={setActiveTab} />}
+                          {(isSuperAdmin || isDepartmentAdmin) && <SidebarLink id="report" icon={FileText} label="Report" active={activeTab} set={setActiveTab} />}
                           {isSuperAdmin && <SidebarLink id="settings" icon={Settings} label="Configuration" active={activeTab} set={setActiveTab} />}
                       </nav>
                   </div>
@@ -853,7 +1034,7 @@ function setup() {
                               <div className="w-8 h-8 bg-emerald-500 rounded-full flex items-center justify-center text-white font-bold text-xs">{currentUser.name.charAt(0)}</div>
                               <div className="overflow-hidden">
                                   <p className="text-sm font-bold text-white truncate w-32">{currentUser.name}</p>
-                                  <p className="text-[10px] text-slate-400 truncate w-32">{currentUser.role === 'admin' ? 'Administrator' : 'Employee'}</p>
+                                  <p className="text-[10px] text-slate-400 truncate w-32">{currentUser.role === 'admin' ? (isSuperAdmin ? 'HR / Super Admin' : `${currentUser.department} Head`) : 'Employee'}</p>
                               </div>
                           </div>
                       </div>
@@ -872,7 +1053,7 @@ function setup() {
                         <div><p className="text-emerald-100/60 text-[10px] font-bold tracking-widest uppercase mb-px">Welcome</p><h1 className="text-white font-bold text-lg tracking-tight">{currentUser.name.split(' ')[0]}</h1></div>
                       </div>
                       <div className="flex gap-3 items-center">
-                          {currentUser.role === 'user' && (
+                          {(isRegularUser || isDepartmentAdmin) && (
                             <button onClick={() => setShowPasswordModal(true)} className="p-2.5 bg-white/5 rounded-xl hover:bg-white/10 transition-all backdrop-blur-md border border-white/5"><Settings size={18} className="text-white"/></button>
                           )}
                           <div className="relative">
@@ -881,10 +1062,16 @@ function setup() {
                       </div>
                     </div>
                     <div className="relative z-20 pl-1">
-                        {currentUser.role === 'user' ? (
-                            <h2 className="text-2xl font-light text-white/90 leading-tight">{getGreeting()}, <br/><span className="font-bold text-white">Ready to start?</span></h2>
+                        {activeTab === 'apply' ? (
+                             <h2 className="text-2xl font-light text-white/90 leading-tight">{getGreeting()}, <br/><span className="font-bold text-white">Ready to apply?</span></h2>
+                        ) : activeTab === 'dashboard' ? (
+                            isSuperAdmin ? (
+                                <h2 className="text-xl font-light text-white/90 leading-tight">HR <span className="font-bold text-white">Dashboard</span></h2>
+                            ) : (
+                                <h2 className="text-xl font-light text-white/90 leading-tight">Dept. <span className="font-bold text-white">Dashboard</span><div className="mt-2 inline-flex items-center gap-2 px-3 py-0.5 bg-emerald-500/10 rounded-full border border-emerald-500/20 backdrop-blur-sm"><Shield size={10} className="text-emerald-400"/><span className="text-[10px] text-emerald-100 font-medium">{currentUser.department}</span></div></h2>
+                            )
                         ) : (
-                            <h2 className="text-xl font-light text-white/90 leading-tight">Admin <span className="font-bold text-white">Dashboard</span><div className="mt-2 inline-flex items-center gap-2 px-3 py-0.5 bg-emerald-500/10 rounded-full border border-emerald-500/20 backdrop-blur-sm"><Shield size={10} className="text-emerald-400"/><span className="text-[10px] text-emerald-100 font-medium">{currentUser.department}</span></div></h2>
+                             <h2 className="text-2xl font-light text-white/90 leading-tight">{getGreeting()}, <br/><span className="font-bold text-white">Welcome Back.</span></h2>
                         )}
                     </div>
                   </header>
@@ -892,11 +1079,17 @@ function setup() {
                   {/* DESKTOP HEADER */}
                   <header className="hidden md:flex bg-white border-b border-slate-200 px-8 py-4 justify-between items-center z-20">
                       <div>
-                          <h2 className="text-xl font-bold text-slate-800">{activeTab === 'dashboard' ? 'Dashboard' : activeTab === 'history' ? 'Leave History' : activeTab === 'users' ? 'Team Management' : activeTab === 'report' ? 'Leave Report' : 'Settings'}</h2>
+                          <h2 className="text-xl font-bold text-slate-800">
+                              {activeTab === 'dashboard' ? (isSuperAdmin ? 'HR Dashboard' : 'Department Dashboard') : 
+                               activeTab === 'apply' ? 'Apply for Leave' :
+                               activeTab === 'history' ? 'My Leave History' : 
+                               activeTab === 'users' ? 'Team Management' : 
+                               activeTab === 'report' ? 'Leave Report' : 'Settings'}
+                          </h2>
                           <p className="text-xs text-slate-500">{getGreeting()}, {currentUser.name.split(' ')[0]}</p>
                       </div>
                       <div className="flex items-center gap-4">
-                          {currentUser.role === 'user' && <button onClick={() => setShowPasswordModal(true)} className="p-2.5 bg-slate-50 rounded-xl hover:bg-slate-100 transition-all text-slate-500"><Settings size={20}/></button>}
+                          {(isRegularUser || isDepartmentAdmin) && <button onClick={() => setShowPasswordModal(true)} className="p-2.5 bg-slate-50 rounded-xl hover:bg-slate-100 transition-all text-slate-500"><Settings size={20}/></button>}
                           <div className="relative">
                               <button onClick={() => {setShowNotifPanel(!showNotifPanel); if(inAppNotifs.filter(n=>!n.read).length) setInAppNotifs(inAppNotifs.map(n=>({...n, read:true})))}} className="p-2.5 bg-slate-50 rounded-xl hover:bg-slate-100 transition-all text-slate-500"><Bell size={20} />{inAppNotifs.some(n=>!n.read) && <span className="absolute top-2 right-2 w-2.5 h-2.5 bg-rose-500 rounded-full border-2 border-white"></span>}</button>
                           </div>
@@ -912,7 +1105,9 @@ function setup() {
                   )}
 
                   <main className="flex-1 overflow-y-auto p-5 md:p-8 pb-28 md:pb-8 -mt-10 md:mt-0 relative z-20 no-scrollbar">
-                    {currentUser.role === 'user' && activeTab === 'dashboard' && (
+                    
+                    {/* APPLICATION FORM (Visible to Regular Users OR Department Admins who need to apply) */}
+                    {(isRegularUser || isDepartmentAdmin) && activeTab === 'apply' && (
                       <div className="animate-fadeIn space-y-5 md:space-y-8 max-w-5xl mx-auto">
                         <div className="flex gap-3 md:gap-6 overflow-x-auto pb-2 px-1 no-scrollbar snap-x md:grid md:grid-cols-4">
                             <BalanceCard type="Earned" used={stats['Earned'] || 0} total={userLimits.earned || 15} icon={PieChart} colorClass="text-emerald-500" bgClass="bg-emerald-50" barClass="bg-emerald-500" />
@@ -922,10 +1117,10 @@ function setup() {
                         </div>
                         <div className="bg-white p-5 md:p-8 rounded-[1.5rem] shadow-lg shadow-slate-200/60 border border-slate-100 relative overflow-hidden">
                             <div className="absolute top-0 right-0 w-20 h-20 bg-vantage-500/5 rounded-full -mr-5 -mt-5 blur-lg"></div>
-                            <h2 className="text-base md:text-lg font-bold text-slate-800 mb-5 flex items-center relative z-10"><Send className="mr-2.5 text-vantage-600" size={18}/> Apply for Leave</h2>
+                            <h2 className="text-base md:text-lg font-bold text-slate-800 mb-5 flex items-center relative z-10"><Send className="mr-2.5 text-vantage-600" size={18}/> Apply for Leave {isDepartmentAdmin && <span className="text-[10px] text-vantage-600 bg-vantage-50 px-2 py-0.5 rounded-full ml-2 font-semibold">HR Approval</span>}</h2>
                             <form onSubmit={handleApply} className="space-y-4 md:space-y-6 relative z-10">
                                 <div className="grid grid-cols-2 gap-3 md:gap-6">
-                                    <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5 block ml-1">Department</label><div className="relative"><select value={formData.department} onChange={(e) => setFormData({...formData, department: e.target.value})} className="w-full p-3 md:p-4 bg-slate-50 rounded-xl border border-slate-200 outline-none focus:ring-2 focus:ring-vantage-100 focus:border-vantage-500 transition-all appearance-none text-xs md:text-sm font-semibold text-slate-700">{DEPARTMENTS.map(dept => <option key={dept} value={dept}>{dept}</option>)}</select><ChevronRight className="absolute right-3 top-3 md:top-4 text-slate-400 rotate-90 pointer-events-none" size={14}/></div></div>
+                                    <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5 block ml-1">Department</label><div className="relative"><select disabled={isDepartmentAdmin} value={formData.department} onChange={(e) => setFormData({...formData, department: e.target.value})} className="w-full p-3 md:p-4 bg-slate-50 rounded-xl border border-slate-200 outline-none focus:ring-2 focus:ring-vantage-100 focus:border-vantage-500 transition-all appearance-none text-xs md:text-sm font-semibold text-slate-700">{DEPARTMENTS.map(dept => <option key={dept} value={dept}>{dept}</option>)}</select><ChevronRight className="absolute right-3 top-3 md:top-4 text-slate-400 rotate-90 pointer-events-none" size={14}/></div></div>
                                     <div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5 block ml-1">Type</label><div className="relative"><select value={formData.leaveType} onChange={(e) => setFormData({...formData, leaveType: e.target.value})} className="w-full p-3 md:p-4 bg-slate-50 rounded-xl border border-slate-200 outline-none focus:ring-2 focus:ring-vantage-100 focus:border-vantage-500 transition-all appearance-none text-xs md:text-sm font-semibold text-slate-700"><option>Earned</option><option>Sick</option><option>Personal Paid</option><option>Personal Unpaid</option></select><ChevronRight className="absolute right-3 top-3 md:top-4 text-slate-400 rotate-90 pointer-events-none" size={14}/></div></div>
                                 </div>
                                 <div className="grid grid-cols-2 gap-3 md:gap-6"><div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5 block ml-1">Start</label><input type="date" required value={formData.startDate} onChange={(e) => setFormData({...formData, startDate: e.target.value})} className="w-full p-3 md:p-4 bg-slate-50 rounded-xl border border-slate-200 outline-none focus:border-vantage-500 text-xs md:text-sm font-semibold text-slate-700"/></div><div><label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5 block ml-1">End</label><input type="date" required value={formData.endDate} onChange={(e) => setFormData({...formData, endDate: e.target.value})} className="w-full p-3 md:p-4 bg-slate-50 rounded-xl border border-slate-200 outline-none focus:border-vantage-500 text-xs md:text-sm font-semibold text-slate-700"/></div></div>
@@ -935,18 +1130,16 @@ function setup() {
                         </div>
                       </div>
                     )}
-
-                    {currentUser.role === 'user' && activeTab === 'history' && (
+                    
+                    {/* ADMIN DASHBOARD (Visible to Department Admins OR Super Admins) */}
+                    {(isSuperAdmin || isDepartmentAdmin) && activeTab === 'dashboard' && (
                       <div className="animate-fadeIn pt-2 max-w-5xl mx-auto">
-                         <div className="flex justify-between items-center mb-4 px-1 md:hidden"><h2 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Request History</h2><button onClick={() => fetchLeaves(false)} className="p-2 bg-white border border-slate-200 rounded-full text-vantage-600 hover:bg-slate-50 active:scale-95 transition-all shadow-sm"><RefreshCw size={14} className={isLoading ? 'animate-spin' : ''}/></button></div>
-                         {leaves.filter(l => l.email === currentUser.email).length === 0 ? <div className="flex flex-col items-center justify-center h-64 text-slate-300 bg-white/50 rounded-[1.5rem] border border-dashed border-slate-200"><List size={40} className="mb-3 opacity-20"/><p className="text-xs font-medium">No records found</p></div> : <div className="space-y-3 md:grid md:grid-cols-2 md:gap-4 md:space-y-0">{leaves.filter(l => l.email === currentUser.email).map(l => <LeaveCard key={l.id} leave={l} isAdmin={false} />)}</div>}
-                      </div>
-                    )}
-
-                    {currentUser.role === 'admin' && activeTab === 'dashboard' && (
-                      <div className="animate-fadeIn pt-2 max-w-5xl mx-auto">
+                        {/* Tab Filters */}
                         <div className="flex gap-2 mb-5 bg-white p-1.5 rounded-xl shadow-lg shadow-slate-200/40 border border-slate-100 sticky top-0 z-30">
-                            <AdminFilterBtn label="Pending" count={adminStats.pending} active={adminSubTab === 'Pending'} onClick={() => setAdminSubTab('Pending')} activeBg="bg-amber-500" />
+                            {isSuperAdmin && (
+                                <AdminFilterBtn label="HR Pending" count={adminStats.adminPending} active={adminSubTab === 'Admin Pending'} onClick={() => setAdminSubTab('Admin Pending')} activeBg="bg-purple-500" />
+                            )}
+                            <AdminFilterBtn label="Pending" count={adminStats.regularPending} active={adminSubTab === 'Pending'} onClick={() => setAdminSubTab('Pending')} activeBg="bg-amber-500" />
                             <AdminFilterBtn label="Approved" count={adminStats.approved} active={adminSubTab === 'Approved'} onClick={() => setAdminSubTab('Approved')} activeBg="bg-emerald-500" />
                             <AdminFilterBtn label="Rejected" count={adminStats.rejected} active={adminSubTab === 'Rejected'} onClick={() => setAdminSubTab('Rejected')} activeBg="bg-rose-500" />
                         </div>
@@ -968,6 +1161,16 @@ function setup() {
                       </div>
                     )}
 
+
+                    {/* LEAVE HISTORY (Visible to Regular Users AND Department Admins) */}
+                    {(isRegularUser || isDepartmentAdmin) && activeTab === 'history' && (
+                      <div className="animate-fadeIn pt-2 max-w-5xl mx-auto">
+                         <div className="flex justify-between items-center mb-4 px-1 md:hidden"><h2 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Request History</h2><button onClick={() => fetchLeaves(false)} className="p-2 bg-white border border-slate-200 rounded-full text-vantage-600 hover:bg-slate-50 active:scale-95 transition-all shadow-sm"><RefreshCw size={14} className={isLoading ? 'animate-spin' : ''}/></button></div>
+                         {leaves.filter(l => l.email === currentUser.email).length === 0 ? <div className="flex flex-col items-center justify-center h-64 text-slate-300 bg-white/50 rounded-[1.5rem] border border-dashed border-slate-200"><List size={40} className="mb-3 opacity-20"/><p className="text-xs font-medium">No records found</p></div> : <div className="space-y-3 md:grid md:grid-cols-2 md:gap-4 md:space-y-0">{leaves.filter(l => l.email === currentUser.email).map(l => <LeaveCard key={l.id} leave={l} isAdmin={false} />)}</div>}
+                      </div>
+                    )}
+
+                    {/* TEAM ALLOCATIONS (Visible to Super Admin only) */}
                     {isSuperAdmin && activeTab === 'users' && (
                         <div className="animate-fadeIn pt-2 max-w-5xl mx-auto">
                             <div className="bg-white p-5 rounded-[1.5rem] shadow-sm border border-slate-100 mb-5 flex justify-between items-center">
@@ -1064,16 +1267,19 @@ function setup() {
                     )}
                     
                     {/* NEW REPORT TAB */}
-                    {isSuperAdmin && activeTab === 'report' && (
+                    {currentUser.role === 'admin' && activeTab === 'report' && (
                         <div className="animate-fadeIn pt-2 max-w-5xl mx-auto">
                              <div className="bg-white p-5 rounded-[1.5rem] shadow-sm border border-slate-100 mb-5 flex justify-between items-center">
                                <div>
                                  <h2 className="text-base font-bold text-slate-800 mb-1 flex items-center gap-2"><FileText className="text-vantage-600" size={18}/> Leave Report</h2>
-                                 <p className="text-[10px] text-slate-400">Comprehensive usage summary.</p>
+                                 <p className="text-[10px] text-slate-400">Comprehensive usage summary for {currentUser.department === 'All' ? 'All Departments' : currentUser.department} department.</p>
                                </div>
                             </div>
                             <div className="space-y-3 md:grid md:grid-cols-2 md:gap-4 md:space-y-0">
-                                {allUsers.length === 0 ? <div className="text-center text-slate-400 mt-10 text-xs col-span-2">Loading...</div> : allUsers.filter(u => u.role === 'user' && !u.isDeleted).map((user, idx) => {
+                                {allUsers.length === 0 ? <div className="text-center text-slate-400 mt-10 text-xs col-span-2">Loading...</div> : allUsers
+                                    // Filter users based on admin's department, only include non-deleted employees
+                                    .filter(u => u.role === 'user' && !u.isDeleted && (currentUser.department === 'All' || u.department === currentUser.department))
+                                    .map((user, idx) => {
                                     const stats = calculateUserLeaveBreakdown(user.email);
                                     return (
                                         <div key={idx} className="bg-white p-4 rounded-[1.25rem] shadow-sm border border-slate-100 mb-3 flex flex-col gap-3">
@@ -1337,10 +1543,28 @@ function setup() {
                   {/* MOBILE BOTTOM NAV */}
                   <div className="md:hidden fixed bottom-5 left-0 right-0 px-5 z-30">
                       <nav className="bg-white/90 backdrop-blur-xl border border-white/50 shadow-xl shadow-vantage-900/5 rounded-[1.5rem] flex justify-around items-center h-16 px-1">
-                        <NavBtn id="dashboard" icon={currentUser.role === 'admin' ? LayoutGrid : Send} label={currentUser.role === 'admin' ? "Admin" : "Apply"} active={activeTab} set={setActiveTab} />
-                        {currentUser.role === 'user' && <NavBtn id="history" icon={List} label="History" active={activeTab} set={setActiveTab} />}
+                        
+                        {(isSuperAdmin || isDepartmentAdmin) && (
+                            <NavBtn 
+                                id="dashboard" 
+                                icon={LayoutGrid} 
+                                label={isSuperAdmin ? "HR" : "Dept."} 
+                                active={activeTab} 
+                                set={setActiveTab} 
+                            />
+                        )}
+                        {(isRegularUser || isDepartmentAdmin) && (
+                            <NavBtn 
+                                id="apply" 
+                                icon={Send} 
+                                label="Apply" 
+                                active={activeTab} 
+                                set={setActiveTab} 
+                            />
+                        )}
+                        {(isRegularUser || isDepartmentAdmin) && <NavBtn id="history" icon={List} label="History" active={activeTab} set={setActiveTab} />}
                         {isSuperAdmin && <NavBtn id="users" icon={Users} label="Team" active={activeTab} set={setActiveTab} />}
-                        {isSuperAdmin && <NavBtn id="report" icon={FileText} label="Report" active={activeTab} set={setActiveTab} />}
+                        {(isSuperAdmin || isDepartmentAdmin) && <NavBtn id="report" icon={FileText} label="Report" active={activeTab} set={setActiveTab} />}
                         {isSuperAdmin && <NavBtn id="settings" icon={Settings} label="Config" active={activeTab} set={setActiveTab} />}
                         <NavBtn id="logout" icon={LogOut} label="Logout" active={activeTab} action={handleLogout} danger={true} />
                       </nav>
