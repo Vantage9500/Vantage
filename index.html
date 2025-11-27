@@ -45,7 +45,7 @@
           Users, Edit3, MessageSquare, Bell, Trash2, LayoutGrid, Hexagon, Key, DollarSign, UserMinus, UserPlus, Mail, CheckSquare, XSquare, UserCog, Archive, RotateCcw, FileText, Code, Copy
         } from 'lucide-react';
 
-        // Embedded Google Apps Script Code
+        // Embedded Google Apps Script Code (UPDATED FOR CASE INSENSITIVITY)
         const APPS_SCRIPT_TEMPLATE = `
 const SHEET_LEAVES = "Leaves";
 const SHEET_USERS = "Users";
@@ -95,7 +95,7 @@ function doPost(e) {
       return response({status: 'error', message: 'Invalid email or password'});
     }
 
-    // 2. DELETE / RESTORE USER (NEW)
+    // 2. DELETE / RESTORE USER
     else if (data.action === "set_user_deleted_status") {
       const sheet = ss.getSheetByName(SHEET_USERS);
       const rows = sheet.getDataRange().getValues();
@@ -109,7 +109,7 @@ function doPost(e) {
       return response({status: 'error', message: 'User not found'});
     }
 
-    // 3. REGISTER
+    // 3. REGISTER (User signs up, sets Is_Active=false)
     else if (data.action === "register") {
       const sheet = ss.getSheetByName(SHEET_USERS);
       const users = sheet.getDataRange().getValues();
@@ -118,15 +118,15 @@ function doPost(e) {
            return response({status: 'error', message: 'Email already registered'});
         }
       }
-      // Append with Is_Deleted = false (last column)
+      // Append with Is_Active = false, Is_Deleted = false. FORCE LOWERCASE EMAIL
       sheet.appendRow([
-        data.name, data.email, data.password, "user", "Unassigned", 
+        data.name, String(data.email).toLowerCase(), data.password, "user", "Unassigned", 
         15, 10, 5, 5, true, false, false
       ]);
       return response({status: 'success', message: 'Registration successful.'});
     }
 
-    // 4. ADMIN UPDATE USER
+    // 4. ADMIN UPDATE USER (Update Role/Dept/Quotas/Active status of existing user)
     else if (data.action === "admin_update_user") {
       const sheet = ss.getSheetByName(SHEET_USERS);
       const rows = sheet.getDataRange().getValues();
@@ -144,8 +144,27 @@ function doPost(e) {
       }
       return response({status: 'error', message: 'User not found'});
     }
+    
+    // 5. ADMIN ADD USER (New: Admin adds user, sets Is_Active=true immediately)
+    else if (data.action === "add_user") {
+      const sheet = ss.getSheetByName(SHEET_USERS);
+      const users = sheet.getDataRange().getValues();
+      // Check if email already exists
+      for (let i = 1; i < users.length; i++) {
+        if (String(users[i][1]).toLowerCase() === String(data.email).toLowerCase()) {
+           return response({status: 'error', message: 'Email already registered'});
+        }
+      }
+      // Append new user, setting Email_Notifications=true, Is_Active=true, Is_Deleted=false. FORCE LOWERCASE EMAIL
+      sheet.appendRow([
+        data.name, String(data.email).toLowerCase(), data.password, data.role, data.department, 
+        data.earned, data.sick, data.personalPaid, data.personalUnpaid, 
+        true, true, false
+      ]);
+      return response({status: 'success', message: 'User added successfully.'});
+    }
 
-    // 5. CHANGE PASSWORD / EMAIL PREF / APPLY / UPDATE STATUS (Standard)
+    // 6. CHANGE PASSWORD / EMAIL PREF / APPLY / UPDATE STATUS (Standard)
     else if (data.action === "change_password") {
       const sheet = ss.getSheetByName(SHEET_USERS);
       const rows = sheet.getDataRange().getValues();
@@ -170,8 +189,9 @@ function doPost(e) {
     }
     else if (data.action === "apply") {
       const sheet = ss.getSheetByName(SHEET_LEAVES);
+      // FORCE LOWERCASE EMAIL
       sheet.appendRow([
-        data.id, new Date(), data.name, data.email, data.department, 
+        data.id, new Date(), data.name, String(data.email).toLowerCase(), data.department, 
         data.leaveType, data.startDate, data.endDate, data.reason, "Pending", ""
       ]);
       sendEmailToAdmins(ss, data);
@@ -212,22 +232,39 @@ function doPost(e) {
   }
 }
 
-// ... (Keep sendEmailToAdmins, sendEmailToUser helper functions same as before)
+// Helper function to send email notifications to admins
 function sendEmailToAdmins(ss, leaveData) {
   try {
     const userSheet = ss.getSheetByName(SHEET_USERS);
     const users = userSheet.getDataRange().getValues();
     users.forEach(u => {
-      const isEmailOn = u[9] === "" ? true : u[9];
+      // Column J (Index 9) is Email_Notifications
+      const isEmailOn = u[9] === "" ? true : u[9]; 
+      // Column D (Index 3) is Role, Column E (Index 4) is Department
       if (u[3] === 'admin' && isEmailOn === true && (u[4] === 'All' || u[4] === leaveData.department)) {
-          MailApp.sendEmail({to: u[1], subject: \`🔔 New Request: \${leaveData.name}\`, htmlBody: \`<p>New request from \${leaveData.name}.</p>\`});
+          // Send a basic email. For production, this should include more details.
+          MailApp.sendEmail({to: u[1], subject: \`🔔 New Leave Request: \${leaveData.name} (\${leaveData.department})\`, htmlBody: \`<p>A new leave request has been submitted by \${leaveData.name} (\${leaveData.email}) for \${leaveData.leaveType} from \${leaveData.startDate} to \${leaveData.endDate}.</p><p>Reason: \${leaveData.reason}</p>\`});
       }
     });
-  } catch (e) {}
+  } catch (e) {
+    // Suppress email errors but log for debugging if needed
+    Logger.log("Error sending email to admins: " + e.toString());
+  }
 }
 
+// Helper function to send email notification to the user
 function sendEmailToUser(email, name, status, message) {
-  try { MailApp.sendEmail({to: email, subject: \`Leave \${status}\`, htmlBody: \`<p>Your request is \${status}.</p>\`}); } catch (e) {}
+  try { 
+    let subject = \`Leave Request \${status}\`;
+    let body = \`<p>Dear \${name},</p><p>Your leave request has been **\${status}**.\`;
+    if (message) {
+      body += \` The administrator left the following message: <em>"\${message}"</em>\`;
+    }
+    body += '</p><p>Thank you.</p>';
+    MailApp.sendEmail({to: email, subject: subject, htmlBody: body}); 
+  } catch (e) {
+    Logger.log("Error sending email to user: " + e.toString());
+  }
 }
 
 function doGet(e) {
@@ -237,25 +274,26 @@ function doGet(e) {
   if (action === "users") {
     const sheet = ss.getSheetByName(SHEET_USERS);
     const rows = sheet.getDataRange().getValues();
-    rows.shift(); 
+    rows.shift(); // Remove header row
     const users = rows.map(r => ({
       name: r[0], email: r[1], password: r[2], role: r[3], department: r[4],
       limits: { earned: r[5] || 15, sick: r[6] || 10, personalPaid: r[7] || 5, personalUnpaid: r[8] || 5 },
       emailEnabled: r[9] === "" ? true : r[9],
       isActive: r[10] === "" ? true : r[10],
-      isDeleted: r[11] === true // New Deleted Column
+      isDeleted: r[11] === true // Column L (Index 11)
     }));
     return response({status: 'success', data: users});
   }
 
+  // Default action: Fetch Leaves
   const sheet = ss.getSheetByName(SHEET_LEAVES);
   const rows = sheet.getDataRange().getValues();
-  rows.shift(); 
+  rows.shift(); // Remove header row
   const data = rows.map(row => ({
     id: row[0], timestamp: row[1], name: row[2], email: row[3], department: row[4],
     leaveType: row[5], startDate: row[6], endDate: row[7], reason: row[8], status: row[9],
     adminMessage: row[10]
-  })).reverse();
+  })).reverse(); // Reverse to show latest first
   return response({status: 'success', data: data});
 }
 
@@ -263,8 +301,10 @@ function response(data) {
   return ContentService.createTextOutput(JSON.stringify(data)).setMimeType(ContentService.MimeType.JSON);
 }
 
+// Sets up required sheets and headers, including a default admin user.
 function setup() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
   let leavesSheet = ss.getSheetByName(SHEET_LEAVES);
   if (!leavesSheet) { leavesSheet = ss.insertSheet(SHEET_LEAVES); }
   if (leavesSheet.getLastRow() === 0) {
@@ -274,14 +314,16 @@ function setup() {
   let userSheet = ss.getSheetByName(SHEET_USERS);
   if (!userSheet) { userSheet = ss.insertSheet(SHEET_USERS); }
   
-  // Add Is_Deleted column if it doesn't exist (Col 12)
+  // Define the comprehensive header for the Users sheet
   const header = ["Name", "Email", "Password", "Role", "Department", "Earned_Quota", "Sick_Quota", "Personal_Paid_Quota", "Personal_Unpaid_Quota", "Email_Notifications", "Is_Active", "Is_Deleted"];
   
   if (userSheet.getLastRow() === 0) {
       userSheet.appendRow(header);
+      // Create a default Super Admin account (Password: admin123)
       userSheet.appendRow(["Super Admin", "admin@company.com", "admin123", "admin", "All", 99, 99, 99, 99, true, true, false]);
   } else {
-     userSheet.getRange(1, 1, 1, header.length).setValues([header]); 
+      // Ensure header row is correct if sheet existed but was modified
+      userSheet.getRange(1, 1, 1, header.length).setValues([header]); 
   }
 }
 `;
@@ -298,6 +340,7 @@ function setup() {
           const [allUsers, setAllUsers] = useState([]); 
           
           const [showArchive, setShowArchive] = useState(false);
+          // Set a default value to allow easy testing for the user
           const [scriptUrl, setScriptUrl] = useState('https://script.google.com/macros/s/AKfycbywHdk55GxXQ_FPDdhZEJaalMnqYkBZmRbxFpCMuYzZNNbd_cqAiuxFsaSdsHtTLvLz/exec');
           
           const [isLoading, setIsLoading] = useState(false);
@@ -323,9 +366,19 @@ function setup() {
           
           const [emailEnabled, setEmailEnabled] = useState(true);
           const [showAddUserModal, setShowAddUserModal] = useState(false);
-          const [newUser, setNewUser] = useState({ name: '', email: '', password: '', role: 'user', department: 'Brokerage', earned: 15, sick: 10, personalPaid: 5, personalUnpaid: 5 });
+          const [newUser, setNewUser] = useState({ 
+              name: '', 
+              email: '', 
+              password: '', 
+              role: 'user', 
+              department: DEPARTMENTS[0], 
+              earned: 15, 
+              sick: 10, 
+              personalPaid: 5, 
+              personalUnpaid: 5 
+          });
 
-          const [formData, setFormData] = useState({ department: 'Brokerage', leaveType: 'Earned', startDate: '', endDate: '', reason: '' });
+          const [formData, setFormData] = useState({ department: DEPARTMENTS[0], leaveType: 'Earned', startDate: '', endDate: '', reason: '' });
 
           const getGreeting = () => {
             const hour = new Date().getHours();
@@ -352,6 +405,10 @@ function setup() {
             if (savedUrl) setScriptUrl(savedUrl);
             const savedNotifs = localStorage.getItem('leave_app_notifications');
             if (savedNotifs) setInAppNotifs(JSON.parse(savedNotifs));
+            
+            // Set default department for apply form and new user form
+            setFormData(prev => ({...prev, department: DEPARTMENTS[0]}));
+            setNewUser(prev => ({...prev, department: DEPARTMENTS[0]}));
           }, []);
 
           useEffect(() => { localStorage.setItem('leave_app_notifications', JSON.stringify(inAppNotifs)); }, [inAppNotifs]);
@@ -376,7 +433,8 @@ function setup() {
                 }
             }
             if (currentUser?.role === 'user') {
-                const myCurrentLeaves = leaves.filter(l => l.email === currentUser.email);
+                // FIXED: Case insensitive match for notifications
+                const myCurrentLeaves = leaves.filter(l => String(l.email).toLowerCase() === String(currentUser.email).toLowerCase());
                 myCurrentLeaves.forEach(currLeave => {
                     const prevLeave = prevLeavesRef.current.find(p => p.id === currLeave.id);
                     if (prevLeave && prevLeave.status === 'Pending' && currLeave.status !== 'Pending') {
@@ -393,9 +451,10 @@ function setup() {
           const showToast = (msg, type = 'success') => { setNotification({ msg, type }); setTimeout(() => setNotification(null), 4000); };
           const getDaysDiff = (start, end) => { const d1 = new Date(start); const d2 = new Date(end); return Math.ceil(Math.abs(d2 - d1) / (1000 * 60 * 60 * 24)) + 1 || 0; };
 
+          // FIXED: Case insensitive stats calculation
           const getLeaveStats = () => {
             const stats = { 'Earned': 0, 'Sick': 0, 'Personal Paid': 0, 'Personal Unpaid': 0 };
-            leaves.filter(l => l.email === currentUser.email && l.status === 'Approved').forEach(l => {
+            leaves.filter(l => String(l.email).toLowerCase() === String(currentUser.email).toLowerCase() && l.status === 'Approved').forEach(l => {
                 if (stats[l.leaveType] !== undefined) stats[l.leaveType] += getDaysDiff(l.startDate, l.endDate);
             });
             return stats;
@@ -415,14 +474,15 @@ function setup() {
             return stats;
           };
 
+          // FIXED: Case insensitive total taken
           const calculateUserTakenLeaves = (userEmail) => {
-             return leaves.filter(l => l.email === userEmail && l.status === 'Approved').reduce((acc, leave) => acc + getDaysDiff(leave.startDate, leave.endDate), 0);
+             return leaves.filter(l => String(l.email).toLowerCase() === String(userEmail).toLowerCase() && l.status === 'Approved').reduce((acc, leave) => acc + getDaysDiff(leave.startDate, leave.endDate), 0);
           };
           
-          // NEW: Breakdown for Report
+          // FIXED: Case insensitive breakdown
           const calculateUserLeaveBreakdown = (userEmail) => {
             const breakdown = { Earned: 0, Sick: 0, 'Personal Paid': 0, 'Personal Unpaid': 0, Total: 0 };
-            leaves.filter(l => l.email === userEmail && l.status === 'Approved').forEach(l => {
+            leaves.filter(l => String(l.email).toLowerCase() === String(userEmail).toLowerCase() && l.status === 'Approved').forEach(l => {
                 const days = getDaysDiff(l.startDate, l.endDate);
                 if (breakdown[l.leaveType] !== undefined) {
                     breakdown[l.leaveType] += days;
@@ -456,19 +516,43 @@ function setup() {
           const handleSignup = async (e) => {
             e.preventDefault();
             setIsLoginLoading(true);
+            
+            if (!scriptUrl) { showToast("Database URL missing.", "error"); setIsLoginLoading(false); return; }
+
             try {
-                const resp = await fetch(scriptUrl, { 
-                    method: 'POST', mode: 'no-cors', 
+                const checkResp = await fetch(scriptUrl + "?action=users");
+                const checkData = await checkResp.json();
+                
+                if (checkData.status === 'success') {
+                    const exists = checkData.data.some(u => String(u.email).toLowerCase() === String(email).toLowerCase());
+                    if (exists) {
+                        showToast("Email already registered.", "error");
+                        setIsLoginLoading(false);
+                        return;
+                    }
+                }
+
+                await fetch(scriptUrl, { 
+                    method: 'POST', 
+                    mode: 'no-cors', 
                     headers: { 'Content-Type': 'application/json' }, 
                     body: JSON.stringify({ 
                         action: 'register', 
-                        name, email, password 
+                        name, 
+                        email: email.toLowerCase(), // FORCE LOWERCASE
+                        password 
                     }) 
                 });
+
                 showToast("Signup Successful! Wait for Admin approval.");
                 setView('login');
                 setName(''); setEmail(''); setPassword('');
-            } catch (e) { showToast("Signup Failed", "error"); } finally { setIsLoginLoading(false); }
+
+            } catch (e) { 
+                showToast("Signup Request Failed", "error"); 
+            } finally { 
+                setIsLoginLoading(false); 
+            }
           };
 
           const toggleEmailNotifications = async () => {
@@ -530,6 +614,7 @@ function setup() {
                     u.email === targetUser.email ? {
                         ...u, 
                         isDeleted: isDeleted,
+                        // If restored, ensure they are also set to active
                         isActive: isDeleted ? u.isActive : true 
                     } : u
                 ));
@@ -583,15 +668,41 @@ function setup() {
              } catch (e) { showToast("Update Failed", "error"); } finally { setIsLoading(false); }
           };
 
-          const handleAddUser = async () => {
-            if(!newUser.name || !newUser.email || !newUser.password) return showToast("Fill all fields", "error");
+          // IMPLEMENTED: Logic for Admin Add User
+          const handleAddUser = async (e) => {
+            e.preventDefault();
+            if(!newUser.name || !newUser.email || !newUser.password) return showToast("Fill Name, Email, and Password.", "error");
             setIsLoading(true);
             try {
-                const resp = await fetch(scriptUrl, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'add_user', ...newUser }) });
+                // Since this is a POST request that changes the database, we rely on the request succeeding.
+                await fetch(scriptUrl, { 
+                    method: 'POST', 
+                    mode: 'no-cors', 
+                    headers: { 'Content-Type': 'application/json' }, 
+                    body: JSON.stringify({ 
+                        action: 'add_user', 
+                        ...newUser,
+                        email: newUser.email.toLowerCase(), // FORCE LOWERCASE
+                        earned: Number(newUser.earned), // Ensure numbers are sent as numbers
+                        sick: Number(newUser.sick),
+                        personalPaid: Number(newUser.personalPaid),
+                        personalUnpaid: Number(newUser.personalUnpaid)
+                    }) 
+                });
                 showToast("User Added Successfully!");
                 setShowAddUserModal(false);
                 fetchUsersList(); 
-                setNewUser({ name: '', email: '', password: '', role: 'user', department: 'Brokerage', earned: 15, sick: 10, personalPaid: 5, personalUnpaid: 5 });
+                setNewUser({ 
+                    name: '', 
+                    email: '', 
+                    password: '', 
+                    role: 'user', 
+                    department: DEPARTMENTS[0], 
+                    earned: 15, 
+                    sick: 10, 
+                    personalPaid: 5, 
+                    personalUnpaid: 5 
+                });
             } catch (e) { showToast("Failed to add user", "error"); } finally { setIsLoading(false); }
           };
 
@@ -620,8 +731,19 @@ function setup() {
           };
 
           const copyToClipboard = () => {
-              navigator.clipboard.writeText(APPS_SCRIPT_TEMPLATE);
-              showToast("Code Copied to Clipboard!");
+              // Fallback for document.execCommand('copy') as navigator.clipboard might not work in some iframe environments
+              const textarea = document.createElement('textarea');
+              textarea.value = APPS_SCRIPT_TEMPLATE;
+              document.body.appendChild(textarea);
+              textarea.focus();
+              textarea.select();
+              try {
+                  document.execCommand('copy');
+                  showToast("Code Copied to Clipboard!");
+              } catch (err) {
+                  showToast("Failed to copy code.", "error");
+              }
+              document.body.removeChild(textarea);
           };
 
           // --- Components ---
@@ -736,7 +858,7 @@ function setup() {
               <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-6 font-sans relative overflow-hidden">
                 <div className="absolute top-0 left-0 w-full h-3/5 bg-vantage-900 rounded-b-[4rem] z-0 shadow-2xl"></div>
                 <div className="absolute top-20 right-10 w-72 h-72 bg-vantage-800 rounded-full mix-blend-multiply filter blur-3xl opacity-30 animate-pulse z-0"></div>
-                {notification && <div className="absolute top-10 bg-rose-500 text-white px-6 py-3 rounded-full shadow-xl animate-bounce z-50 text-sm font-medium flex items-center gap-2"><AlertCircle size={16}/> {notification.msg}</div>}
+                {notification && <div className={`absolute top-10 ${notification.type === 'error' ? 'bg-rose-500' : 'bg-vantage-900'} text-white px-6 py-3 rounded-full shadow-xl animate-bounce z-50 text-sm font-medium flex items-center gap-2`}><AlertCircle size={16}/> {notification.msg}</div>}
                 <div className="w-full max-w-sm bg-white/90 backdrop-blur-xl rounded-[2.5rem] shadow-[0_20px_50px_rgba(0,0,0,0.15)] overflow-hidden border border-white/60 z-10">
                   <div className="p-8 pt-12 text-center">
                     <div className="w-20 h-20 bg-gradient-to-br from-vantage-800 to-vantage-600 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-2xl shadow-vantage-900/30 transform rotate-6"><Hexagon className="text-white fill-white/10" size={40} strokeWidth={1.5} /></div>
@@ -1082,7 +1204,7 @@ function setup() {
                                         <div className="flex items-center gap-2 mb-1"><div className="p-2 bg-vantage-50 rounded-lg text-vantage-600"><UserCog size={16}/></div><h3 className="text-base font-bold text-slate-800">Manage User</h3></div>
                                         <p className="text-xs text-slate-500 pl-10 -mt-1">For: <span className="font-bold text-slate-800">{editingUser.name}</span></p>
                                     </div>
-                                    {/* DELETE BUTTON */}
+                                    {/* ARCHIVE/DELETE BUTTON */}
                                     <button onClick={() => { if(confirm("Archive this user? They will be moved to the Archive list.")) handleUserStatusChange(editingUser, true); }} className="p-2 bg-rose-50 text-rose-500 rounded-xl hover:bg-rose-100 border border-rose-100 transition-colors"><Trash2 size={18}/></button>
                                 </div>
                                 
@@ -1122,10 +1244,10 @@ function setup() {
 
                                     <p className="text-[10px] font-bold text-slate-400 uppercase mt-2">Leave Quotas</p>
                                     <div className="grid grid-cols-2 gap-2">
-                                        <div><label className="text-[9px] text-slate-400">Earned</label><input type="number" value={allocations.earned} onChange={(e) => setAllocations({...allocations, earned: e.target.value})} className="w-full p-2 bg-slate-50 border rounded-lg text-xs text-center"/></div>
-                                        <div><label className="text-[9px] text-slate-400">Sick</label><input type="number" value={allocations.sick} onChange={(e) => setAllocations({...allocations, sick: e.target.value})} className="w-full p-2 bg-slate-50 border rounded-lg text-xs text-center"/></div>
-                                        <div><label className="text-[9px] text-slate-400">P.Paid</label><input type="number" value={allocations.personalPaid} onChange={(e) => setAllocations({...allocations, personalPaid: e.target.value})} className="w-full p-2 bg-slate-50 border rounded-lg text-xs text-center"/></div>
-                                        <div><label className="text-[9px] text-slate-400">P.Unpaid</label><input type="number" value={allocations.personalUnpaid} onChange={(e) => setAllocations({...allocations, personalUnpaid: e.target.value})} className="w-full p-2 bg-slate-50 border rounded-lg text-xs text-center"/></div>
+                                        <div><label className="text-[9px] text-slate-400">Earned</label><input type="number" value={allocations.earned} onChange={(e) => setAllocations({...allocations, earned: Number(e.target.value)})} className="w-full p-2 bg-slate-50 border rounded-lg text-xs text-center"/></div>
+                                        <div><label className="text-[9px] text-slate-400">Sick</label><input type="number" value={allocations.sick} onChange={(e) => setAllocations({...allocations, sick: Number(e.target.value)})} className="w-full p-2 bg-slate-50 border rounded-lg text-xs text-center"/></div>
+                                        <div><label className="text-[9px] text-slate-400">P.Paid</label><input type="number" value={allocations.personalPaid} onChange={(e) => setAllocations({...allocations, personalPaid: Number(e.target.value)})} className="w-full p-2 bg-slate-50 border rounded-lg text-xs text-center"/></div>
+                                        <div><label className="text-[9px] text-slate-400">P.Unpaid</label><input type="number" value={allocations.personalUnpaid} onChange={(e) => setAllocations({...allocations, personalUnpaid: Number(e.target.value)})} className="w-full p-2 bg-slate-50 border rounded-lg text-xs text-center"/></div>
                                     </div>
                                 </div>
 
@@ -1133,6 +1255,59 @@ function setup() {
                             </div>
                         </div>
                     )}
+
+                    {/* NEW: ADD USER MODAL */}
+                    {showAddUserModal && (
+                        <div className="fixed inset-0 bg-vantage-900/60 backdrop-blur-sm flex items-center justify-center z-50 p-6">
+                            <form onSubmit={handleAddUser} className="bg-white w-full max-w-md rounded-[1.5rem] p-6 shadow-2xl animate-fadeIn border border-white/20 max-h-[90vh] overflow-y-auto no-scrollbar">
+                                <div className="flex items-center justify-between mb-6">
+                                    <div className="flex items-center gap-2">
+                                        <div className="p-2 bg-vantage-50 rounded-lg text-vantage-600"><UserPlus size={18}/></div>
+                                        <h3 className="text-lg font-bold text-slate-800">Add New Employee</h3>
+                                    </div>
+                                    <button type="button" onClick={() => setShowAddUserModal(false)} className="p-2 text-slate-400 hover:text-slate-600 transition-colors"><XSquare size={18}/></button>
+                                </div>
+                                
+                                <div className="space-y-4">
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <div><label className="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Full Name</label><input required type="text" value={newUser.name} onChange={(e) => setNewUser({...newUser, name: e.target.value})} className="w-full p-2.5 bg-slate-50 border rounded-xl text-sm outline-none focus:border-vantage-500" placeholder="Jane Doe"/></div>
+                                        <div><label className="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Work Email</label><input required type="email" value={newUser.email} onChange={(e) => setNewUser({...newUser, email: e.target.value})} className="w-full p-2.5 bg-slate-50 border rounded-xl text-sm outline-none focus:border-vantage-500" placeholder="jane@vantage.com"/></div>
+                                    </div>
+                                    <div><label className="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Initial Password</label><input required type="password" value={newUser.password} onChange={(e) => setNewUser({...newUser, password: e.target.value})} className="w-full p-2.5 bg-slate-50 border rounded-xl text-sm outline-none focus:border-vantage-500" placeholder="Secure initial password"/></div>
+
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <div>
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Role</label>
+                                            <select value={newUser.role} onChange={(e) => setNewUser({...newUser, role: e.target.value})} className="w-full p-2.5 bg-slate-50 border rounded-xl text-sm outline-none focus:border-vantage-500">
+                                                <option value="user">Employee</option>
+                                                <option value="admin">Manager/Head</option>
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Department</label>
+                                            <select value={newUser.department} onChange={(e) => setNewUser({...newUser, department: e.target.value})} className="w-full p-2.5 bg-slate-50 border rounded-xl text-sm outline-none focus:border-vantage-500">
+                                                {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+                                            </select>
+                                        </div>
+                                    </div>
+
+                                    <p className="text-[10px] font-bold text-slate-400 uppercase mt-2 pt-2 border-t border-slate-100">Initial Leave Quotas</p>
+                                    <div className="grid grid-cols-4 gap-2">
+                                        <div><label className="text-[9px] text-slate-400">Earned</label><input type="number" value={newUser.earned} onChange={(e) => setNewUser({...newUser, earned: e.target.value})} className="w-full p-2 bg-slate-50 border rounded-lg text-xs text-center" min="0"/></div>
+                                        <div><label className="text-[9px] text-slate-400">Sick</label><input type="number" value={newUser.sick} onChange={(e) => setNewUser({...newUser, sick: e.target.value})} className="w-full p-2 bg-slate-50 border rounded-lg text-xs text-center" min="0"/></div>
+                                        <div><label className="text-[9px] text-slate-400">P.Paid</label><input type="number" value={newUser.personalPaid} onChange={(e) => setNewUser({...newUser, personalPaid: e.target.value})} className="w-full p-2 bg-slate-50 border rounded-lg text-xs text-center" min="0"/></div>
+                                        <div><label className="text-[9px] text-slate-400">P.Unpaid</label><input type="number" value={newUser.personalUnpaid} onChange={(e) => setNewUser({...newUser, personalUnpaid: e.target.value})} className="w-full p-2 bg-slate-50 border rounded-lg text-xs text-center" min="0"/></div>
+                                    </div>
+                                </div>
+
+                                <div className="flex gap-2 mt-6">
+                                    <button type="button" onClick={() => setShowAddUserModal(false)} className="flex-1 py-3 bg-white border border-slate-200 text-slate-600 rounded-xl font-bold text-xs hover:bg-slate-50 transition-colors">Cancel</button>
+                                    <button type="submit" disabled={isLoading} className="flex-1 py-3 bg-vantage-500 text-white rounded-xl font-bold text-xs shadow-lg shadow-vantage-500/20 hover:bg-vantage-600 transition-colors flex items-center justify-center gap-2">{isLoading ? <><RefreshCw className="animate-spin" size={14}/> Adding...</> : 'Confirm & Add User'}</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+
 
                     {/* PASSWORD CHANGE MODAL */}
                     {showPasswordModal && (
@@ -1184,7 +1359,7 @@ function setup() {
                                     <div className="p-2 rounded-lg bg-vantage-100 text-vantage-600"><Code size={18}/></div>
                                     <div><p className="text-xs font-bold text-slate-700">Backend Script</p><p className="text-[10px] text-slate-500">Google Apps Script Code.gs</p></div>
                                 </div>
-                                <button onClick={copyToClipboard} className="flex items-center gap-2 px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-[10px] font-bold text-slate-600 hover:bg-slate-50 active:scale-95 transition-all"><Copy size={12}/> Copy Code</button>
+                                <button type="button" onClick={copyToClipboard} className="flex items-center gap-2 px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-[10px] font-bold text-slate-600 hover:bg-slate-50 active:scale-95 transition-all"><Copy size={12}/> Copy Code</button>
                              </div>
                              <div className="relative">
                                  <textarea readOnly value={APPS_SCRIPT_TEMPLATE} className="w-full h-32 p-3 bg-slate-800 text-slate-300 font-mono text-[10px] rounded-xl outline-none resize-y border border-slate-700" spellCheck="false"></textarea>
